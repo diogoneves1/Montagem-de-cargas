@@ -28,7 +28,7 @@ from leitura import ler_plano
 
 st.set_page_config(
     page_title="Montagem de Cargas",
-    page_icon="📦",
+    page_icon=None,
     layout="wide",
 )
 
@@ -185,7 +185,7 @@ def main():
     st.markdown(
         """
         <div class="cdpb-header">
-            <h1>📦 Montagem de Cargas</h1>
+            <h1>Montagem de Cargas</h1>
         </div>
         <div class="cdpb-subheader">
             Sobe o plano de embarque, o app monta os containers respeitando
@@ -197,7 +197,7 @@ def main():
     )
 
     with st.sidebar:
-        st.header("⚙️ Parâmetros")
+        st.header("Parâmetros")
         st.metric("Peso máximo por container", f"{PESO_MAX:,.0f} kg".replace(",", "."))
         st.metric("Posições de piso por container", MAX_POSICOES_PISO)
         st.markdown(
@@ -217,7 +217,7 @@ def main():
     )
 
     if arquivo is None:
-        st.info("⬆️ Envie um arquivo para começar.")
+        st.info("Envie um arquivo para começar.")
         return
 
     try:
@@ -229,12 +229,12 @@ def main():
             st.code(traceback.format_exc())
         return
 
-    st.success(f"✅ {len(itens)} SKUs lidos do plano de embarque.")
+    st.success(f"{len(itens)} SKUs lidos do plano de embarque.")
 
     with st.expander("Ver itens lidos (antes da montagem)"):
         st.dataframe(pd.DataFrame(itens), use_container_width=True)
 
-    if st.button("🚀 Montar containers", type="primary"):
+    if st.button("Montar containers", type="primary"):
         try:
             with st.spinner("Montando containers..."):
                 containers = distribuir_containers(itens)
@@ -253,7 +253,7 @@ def main():
     containers = st.session_state["containers"]
 
     st.divider()
-    st.subheader(f"📊 Resultado: {len(containers)} containers")
+    st.subheader(f"Resultado: {len(containers)} containers")
 
     peso_total = sum(c.peso for c in containers)
     pallets_total = sum(c.pallets_total for c in containers)
@@ -269,13 +269,13 @@ def main():
     abaixo = [c for c in containers if c.peso < PESO_MAX * 0.9 and c is not containers[-1]]
     if abaixo:
         st.warning(
-            f"⚠️ {len(abaixo)} container(s) intermediário(s) ficaram com menos "
+            f"{len(abaixo)} container(s) intermediário(s) ficaram com menos "
             f"de 90% do peso máximo. Isso pode indicar um desbalanceamento "
             f"entre BASE e FRÁGIL disponíveis no plano."
         )
 
     st.divider()
-    st.subheader("🔍 Detalhe por container")
+    st.subheader("Detalhe por container")
     cntr_selecionado = st.selectbox(
         "Selecione um container para ver o detalhamento",
         options=[c.numero for c in containers],
@@ -290,10 +290,10 @@ def main():
     )
 
     if container_atual.lotes:
-        st.info(f"📋 Lotes presentes neste container: **{', '.join(container_atual.lotes)}**")
+        st.info(f"Lotes presentes neste container: **{', '.join(container_atual.lotes)}**")
 
     st.divider()
-    st.subheader("⬇️ Download")
+    st.subheader("Download")
 
     with st.spinner("Gerando planilha..."):
         nome_base = st.session_state.get("nome_arquivo", "embarque")
@@ -301,7 +301,7 @@ def main():
         excel_bytes = gerar_excel(containers, titulo=titulo)
 
     st.download_button(
-        label="📥 Baixar planilha de montagem (.xlsx)",
+        label="Baixar planilha de montagem (.xlsx)",
         data=excel_bytes,
         file_name="Montagem_Containers.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
