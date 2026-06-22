@@ -1,19 +1,30 @@
 """
 Núcleo da lógica de montagem de containers.
-Replica fielmente a lógica validada da macro VBA v9.1:
-  - FASE 1: SKUs não-frágeis (BASE) ocupam posição de piso.
-  - FASE 2: SKUs frágeis empilham (TOPO) sobre BASE livre (1-para-1) ou
-            ocupam posição própria no piso (PISO) quando não há base.
-  - FASE 1B: se não há mais frágil disponível, mas ainda sobra peso e
-             espaço de piso, completa com mais BASE ignorando a cota
-             (evita containers fechando incompletos).
-  - Cota de BASE distribuída igualmente entre os containers estimados,
-    liberada no último container.
 
-Regras físicas:
-  - PESO_MAX kg por container (pode ultrapassar levemente no último).
-  - MAX_POSICOES_PISO posições de piso (BASE + frágil solto).
-  - Cada posição de BASE sustenta no máximo 1 pallet de frágil empilhado.
+ESTRATÉGIA (v10 — fatiamento proporcional global):
+Em vez de processar container por container sequencialmente (greedy),
+o que causava desbalanceamento quando categorias com kg/pallet muito
+diferentes competiam pelo mesmo espaço (ex: sardinha densa monopolizando
+o peso e empurrando ATUM/AZEITE/frágil para os últimos containers),
+esta versão:
+
+  1. Calcula N = número de containers necessários (pelo peso total).
+  2. Para cada SKU, fationa sua quantidade total em N partes iguais
+     (proporcional), preservando peso/pallets/caixas corretamente.
+  3. Distribui essas fatias entre os N containers, garantindo que cada
+     container receba uma "mistura representativa" de TODAS as
+     categorias (SARDINHA, ATUM, AZEITE, frágil) desde o início — não
+     apenas as mais densas primeiro.
+  4. Dentro de cada container, aplica as regras físicas de POSIÇÃO
+     (BASE / TOPO empilhado / PISO) apenas para organizar onde cada
+     pallet fica, respeitando:
+       - 1 pallet de BASE sustenta no máximo 1 pallet de frágil (TOPO).
+       - AZEITE nunca sustenta nada em cima (BASE sem topo).
+       - POUCH precisa dividir em 2 ao empilhar (consome 2 posições
+         de base por pallet físico).
+       - Máximo MAX_POSICOES_PISO posições de piso por container.
+  5. Sobras que não couberam por limite de piso são redistribuídas
+     entre containers vizinhos com espaço de piso disponível.
 """
 
 from __future__ import annotations
@@ -36,9 +47,7 @@ SKUS_FRAGEIS = {
 
 # >>> Famílias cujo pallet, mesmo não sendo frágil, NÃO sustenta nada
 # empilhado em cima (ex: AZEITE — o pallet não ocupa toda a área do
-# piso, então não há apoio estável para outro pallet por cima). Esses
-# itens ocupam posição de piso normalmente, mas nunca contam para
-# liberar espaço de empilhamento (pBase).
+# piso, então não há apoio estável para outro pallet por cima).
 FAMILIAS_SEM_SUSTENTACAO = {"AZEITE"}
 
 FAM_ORDER = ["SARDINHA", "ATUM", "AZEITE", "OUTROS"]
@@ -57,24 +66,18 @@ class Item:
     qtdPal: float = field(init=False)
     eFragil: bool = field(init=False)
     eSustenta: bool = field(init=False)
+    eDivideAoEmpilhar: bool = field(init=False)
 
     def __post_init__(self):
         self.kgPal = self.rPeso / self.rPal if self.rPal else 0.0
         self.qtdPal = self.rQtd / self.rPal if self.rPal else 0.0
         self.eFragil = self.sku in SKUS_FRAGEIS
-        # >>> Robustez: alguns SKUs no plano vêm com a coluna FAMÍLIA
-        # vazia/zerada (erro de digitação na planilha de origem). Sem
-        # uma família válida, o item ficava invisível para a lógica de
-        # alocação (que busca por família dentro de FAM_ORDER) e sobrava
-        # sem ser alocado. Normaliza para string e usa "OUTROS" como
-        # fallback, garantindo que o item sempre seja processável.
         fam_str = str(self.familia).strip() if self.familia else ""
         if fam_str.upper() not in FAM_ORDER:
             fam_str = "OUTROS"
         self.familia = fam_str
-        # >>> Item "sustenta" empilhamento se NÃO for frágil E a família
-        # não estiver na lista de famílias sem sustentação (ex: AZEITE).
         self.eSustenta = (not self.eFragil) and (self.familia not in FAMILIAS_SEM_SUSTENTACAO)
+        self.eDivideAoEmpilhar = "POUCH" in str(self.produto).upper()
 
 
 @dataclass
@@ -83,7 +86,7 @@ class Linha:
     produto: str
     familia: str
     lote: str | None
-    posicao: str  # "BASE", "TOPO", "PISO"
+    posicao: str
     qtd: float
     pallets: float
     peso: float
@@ -92,7 +95,7 @@ class Linha:
 @dataclass
 class Container:
     numero: int
-    linhas: list[Linha] = field(default_factory=list)
+    linhas: list = field(default_factory=list)
     peso: float = 0.0
     pPiso: float = 0.0
     pTopo: float = 0.0
@@ -107,167 +110,282 @@ class Container:
         return len(set(l.sku for l in self.linhas))
 
     @property
-    def lotes(self) -> list[str]:
+    def lotes(self) -> list:
         return sorted({l.lote for l in self.linhas if l.lote})
 
 
-def _melhor_disponivel(items: list[Item], fragil: bool,
-                        sustenta: bool | None = None) -> Item | None:
-    """Retorna o item disponível (rPeso > 0.01) com maior kg/pallet,
-    respeitando a ordem de prioridade de família (SARDINHA > ATUM >
-    AZEITE > OUTROS). Se `sustenta` for informado, filtra também por
-    essa propriedade (True = pode sustentar empilhamento, False = não)."""
-    for fam in FAM_ORDER:
-        candidatos = [
-            it for it in items
-            if it.eFragil == fragil and it.familia == fam and it.rPeso > 0.01
-            and (sustenta is None or it.eSustenta == sustenta)
-        ]
-        if candidatos:
-            return max(candidatos, key=lambda x: x.kgPal)
-    return None
+def _fatiar_item_em_n(item, n, peso_medio_container):
+    """Divide a quantidade/peso/pallets de um item em fatias.
+
+    Para reduzir fracionamento desnecessário: se o peso TOTAL do item
+    for pequeno em relação ao peso médio de um container (menos de
+    ~15%), ele é colocado em poucas fatias "concentradas" (1 a 3
+    containers) em vez de espalhado igualmente em todos os N — isso
+    mantém SKUs pequenos o mais inteiros possível. Itens grandes (ex:
+    sardinha, pouches volumosos) continuam sendo fatiados em todos os
+    N containers, pois são justamente os que precisam ser distribuídos
+    para equilibrar o peso total."""
+    if n <= 0:
+        return []
+
+    limiar_pequeno = peso_medio_container * 0.15
+    if item.rPeso < limiar_pequeno and item.rPeso > 0:
+        # Quantos containers "concentrados" bastam para acomodar este
+        # item sem ficar fracionado em frações irrelevantes.
+        n_concentrado = max(1, min(n, math.ceil(item.rPeso / max(limiar_pequeno, 1e-6))))
+        fatias = []
+        for i in range(n):
+            if i < n_concentrado:
+                fatias.append(dict(
+                    qtd=item.rQtd / n_concentrado,
+                    peso=item.rPeso / n_concentrado,
+                    pallets=item.rPal / n_concentrado,
+                ))
+            else:
+                fatias.append(dict(qtd=0.0, peso=0.0, pallets=0.0))
+        return fatias
+
+    # Item grande: fatiamento proporcional normal em todos os N.
+    fatias = []
+    for i in range(n):
+        fatias.append(dict(
+            qtd=item.rQtd / n,
+            peso=item.rPeso / n,
+            pallets=item.rPal / n,
+        ))
+    return fatias
 
 
-def _gravar(container: Container, item: Item, qtd: float, pal: float,
-            peso: float, posicao: str) -> Linha:
-    linha = Linha(
-        sku=item.sku, produto=item.produto, familia=item.familia,
-        lote=item.lote, posicao=posicao,
-        qtd=round(qtd, 2), pallets=round(pal, 4), peso=round(peso, 3),
+def _construir_fatias_globais(items, n):
+    peso_total = sum(it.rPeso for it in items)
+    peso_medio_container = peso_total / n if n > 0 else PESO_MAX
+    fatias_por_container = [[] for _ in range(n)]
+    peso_acumulado = [0.0] * n  # rastreia peso já reservado por container
+
+    items_ordenados = sorted(items, key=lambda it: -it.rPeso)
+
+    for item in items_ordenados:
+        fatias = _fatiar_item_em_n(item, n, peso_medio_container)
+        indices_nao_nulos = [i for i, f in enumerate(fatias) if f["pallets"] > 1e-9]
+
+        if 0 < len(indices_nao_nulos) < n:
+            n_concentrado = len(indices_nao_nulos)
+            valores_nao_nulos = [fatias[i] for i in indices_nao_nulos]
+            fatias = [dict(qtd=0.0, peso=0.0, pallets=0.0) for _ in range(n)]
+
+            # >>> Escolhe os N containers com MENOS peso acumulado até
+            # agora (não rotação cega), garantindo que itens pequenos
+            # vão para onde realmente cabe sem ultrapassar PESO_MAX.
+            candidatos_ordenados = sorted(range(n), key=lambda i: peso_acumulado[i])
+            destinos = candidatos_ordenados[:n_concentrado]
+            for k, valor in enumerate(valores_nao_nulos):
+                idx_destino = destinos[k]
+                fatias[idx_destino] = valor
+
+        for c_idx, fatia in enumerate(fatias):
+            if fatia["pallets"] > 1e-9:
+                fatias_por_container[c_idx].append((item, fatia))
+                peso_acumulado[c_idx] += fatia["peso"]
+
+    return fatias_por_container
+
+
+def _organizar_posicoes_container(c_numero, fatias):
+    """Decide a POSIÇÃO (BASE/TOPO/PISO) de cada fatia já decidida
+    para este container, respeitando os limites físicos."""
+    c = Container(numero=c_numero)
+
+    base_sustenta = sorted(
+        [(it, f) for it, f in fatias if it.eSustenta],
+        key=lambda x: -x[0].kgPal,
     )
-    container.linhas.append(linha)
-    container.peso += peso
-    item.rPal -= pal
-    item.rPeso -= peso
-    item.rQtd -= qtd
-    return linha
+    base_sem_sustentar = [(it, f) for it, f in fatias if (not it.eFragil) and not it.eSustenta]
+    fragil = sorted(
+        [(it, f) for it, f in fatias if it.eFragil],
+        key=lambda x: -x[0].kgPal,
+    )
 
-
-def _fase1_base(items: list[Item], c: Container, limite_base: float,
-                 peso_max_este: float = PESO_MAX) -> None:
-    """Preenche o piso com SKUs não-frágeis. Dois sub-tipos:
-      - eSustenta=True (ex: SARDINHA, ATUM): conta em pBase, liberando
-        espaço de empilhamento para frágeis em cima (TOPO).
-      - eSustenta=False (ex: AZEITE): ocupa posição de piso normalmente,
-        mas NÃO conta em pBase (pallet não oferece apoio estável para
-        nada em cima dele).
-    A cota de base (limite_base) se aplica apenas ao que sustenta."""
-    did_add = True
-    while did_add and c.peso < peso_max_este - 0.5 and c.pPiso < MAX_POSICOES_PISO - 1e-6:
-        # Prioriza itens que sustentam enquanto a cota permitir; quando
-        # a cota se esgota, ainda processa os que NÃO sustentam (AZEITE)
-        # livremente, já que eles não competem pela cota de empilhamento.
-        sustenta_disponivel = c.pBase < limite_base - 1e-6
-        item = None
-        if sustenta_disponivel:
-            item = _melhor_disponivel(items, fragil=False, sustenta=True)
-        if item is None:
-            item = _melhor_disponivel(items, fragil=False, sustenta=False)
-        if item is None:
-            break
-        did_add = False
-
-        sp = peso_max_este - c.peso
-        if sp < 0.5:
-            break
-        pc = sp / item.kgPal if item.kgPal > 0 else item.rPal
-        pa = min(pc, item.rPal)
-
-        esp_piso = MAX_POSICOES_PISO - c.pPiso
-        pa = min(pa, esp_piso)
-        if item.eSustenta:
-            esp_cota = limite_base - c.pBase
-            pa = min(pa, esp_cota)
-        if pa < 1e-6:
-            break
-
-        pe = pa * item.kgPal
-        qa = pa * item.qtdPal
-        if c.peso + pe > peso_max_este + 0.01:
-            pa = (peso_max_este - c.peso) / item.kgPal
-            pe = pa * item.kgPal
-            qa = pa * item.qtdPal
-        if pe < 0.01:
+    for item, f in base_sustenta:
+        if f["pallets"] <= 1e-9:
             continue
+        pa = f["pallets"]
+        esp_piso = MAX_POSICOES_PISO - c.pPiso
+        pa_usar = min(pa, max(0.0, esp_piso))
+        if pa_usar <= 1e-9:
+            continue
+        proporcao = pa_usar / pa
+        c.linhas.append(Linha(
+            sku=item.sku, produto=item.produto, familia=item.familia,
+            lote=item.lote, posicao="BASE",
+            qtd=round(f["qtd"] * proporcao, 2),
+            pallets=round(pa_usar, 4),
+            peso=round(f["peso"] * proporcao, 3),
+        ))
+        c.peso += f["peso"] * proporcao
+        c.pBase += pa_usar
+        c.pPiso += pa_usar
 
-        posicao_gravar = "BASE" if item.eSustenta else "BASE (sem topo)"
-        _gravar(c, item, qa, pa, pe, posicao_gravar)
-        if item.eSustenta:
-            c.pBase += pa
-        c.pPiso += pa
-        did_add = True
+    for item, f in base_sem_sustentar:
+        if f["pallets"] <= 1e-9:
+            continue
+        pa = f["pallets"]
+        esp_piso = MAX_POSICOES_PISO - c.pPiso
+        pa_usar = min(pa, max(0.0, esp_piso))
+        if pa_usar <= 1e-9:
+            continue
+        proporcao = pa_usar / pa
+        c.linhas.append(Linha(
+            sku=item.sku, produto=item.produto, familia=item.familia,
+            lote=item.lote, posicao="BASE (sem topo)",
+            qtd=round(f["qtd"] * proporcao, 2),
+            pallets=round(pa_usar, 4),
+            peso=round(f["peso"] * proporcao, 3),
+        ))
+        c.peso += f["peso"] * proporcao
+        c.pPiso += pa_usar
 
-
-def _fase2_fragil(items: list[Item], c: Container, peso_max_este: float = PESO_MAX) -> None:
-    """Distribui SKUs frágeis entre TOPO (empilhado sobre base livre)
-    e PISO (posição própria), respeitando os dois limites físicos."""
-    while True:
-        if not any(it.eFragil and it.rPeso > 0.01 for it in items):
-            break
-        if c.peso >= peso_max_este - 0.5:
-            break
+    for item, f in fragil:
+        if f["pallets"] <= 1e-9:
+            continue
+        pa_total = f["pallets"]
+        fator = 2.0 if item.eDivideAoEmpilhar else 1.0
 
         esp_emp = max(0.0, c.pBase - c.pTopo)
+        max_pa_emp = esp_emp / fator if fator > 0 else 0.0
         esp_piso = max(0.0, MAX_POSICOES_PISO - c.pPiso)
-        if esp_emp < 1e-6 and esp_piso < 1e-6:
+
+        pa_emp = min(pa_total, max_pa_emp)
+        pa_piso_possivel = pa_total - pa_emp
+        pa_piso = min(pa_piso_possivel, esp_piso)
+
+        pa_alocado = pa_emp + pa_piso
+        if pa_alocado <= 1e-9:
+            continue
+
+        if pa_emp > 1e-9:
+            posicao = "TOPO (dividido em 2)" if item.eDivideAoEmpilhar else "TOPO"
+            proporcao_emp = pa_emp / pa_total
+            c.linhas.append(Linha(
+                sku=item.sku, produto=item.produto, familia=item.familia,
+                lote=item.lote, posicao=posicao,
+                qtd=round(f["qtd"] * proporcao_emp, 2),
+                pallets=round(pa_emp, 4),
+                peso=round(f["peso"] * proporcao_emp, 3),
+            ))
+            c.peso += f["peso"] * proporcao_emp
+            c.pTopo += pa_emp * fator
+
+        if pa_piso > 1e-9:
+            proporcao_piso = pa_piso / pa_total
+            c.linhas.append(Linha(
+                sku=item.sku, produto=item.produto, familia=item.familia,
+                lote=item.lote, posicao="PISO",
+                qtd=round(f["qtd"] * proporcao_piso, 2),
+                pallets=round(pa_piso, 4),
+                peso=round(f["peso"] * proporcao_piso, 3),
+            ))
+            c.peso += f["peso"] * proporcao_piso
+            c.pPiso += pa_piso
+
+    return c
+
+
+def _calcular_sobras(fatias_por_container, containers):
+    sobras = []
+    for c_idx, fatias in enumerate(fatias_por_container):
+        c = containers[c_idx]
+        alocado_por_sku = {}
+        for l in c.linhas:
+            alocado_por_sku[l.sku] = alocado_por_sku.get(l.sku, 0.0) + l.pallets
+
+        for item, f in fatias:
+            alocado = alocado_por_sku.get(item.sku, 0.0)
+            if alocado >= f["pallets"] - 1e-9:
+                alocado_por_sku[item.sku] = alocado - f["pallets"]
+                continue
+            residual_pal = f["pallets"] - max(0.0, alocado)
+            if residual_pal > 1e-9:
+                proporcao = residual_pal / f["pallets"] if f["pallets"] > 0 else 0
+                sobras.append((item, {
+                    "qtd": f["qtd"] * proporcao,
+                    "peso": f["peso"] * proporcao,
+                    "pallets": residual_pal,
+                }, c_idx))
+            alocado_por_sku[item.sku] = 0.0
+    return sobras
+
+
+def _tentar_distribuir_com_n(items, n):
+    items_copia = [
+        Item(sku=it.sku, produto=it.produto, familia=it.familia, lote=it.lote,
+             rQtd=it.rQtd, rPeso=it.rPeso, rPal=it.rPal)
+        for it in items
+    ]
+
+    fatias_por_container = _construir_fatias_globais(items_copia, n)
+    containers = [
+        _organizar_posicoes_container(i + 1, fatias_por_container[i])
+        for i in range(n)
+    ]
+
+    for _ in range(5):
+        sobras = _calcular_sobras(fatias_por_container, containers)
+        if not sobras:
             break
 
-        item = _melhor_disponivel(items, fragil=True)
-        if item is None:
+        progresso = False
+        for item, fatia_residual, origem_idx in sobras:
+            candidatos = sorted(
+                range(len(containers)),
+                key=lambda i: -(MAX_POSICOES_PISO - containers[i].pPiso),
+            )
+            for c_idx in candidatos:
+                if c_idx == origem_idx:
+                    continue
+                c = containers[c_idx]
+                esp_piso = MAX_POSICOES_PISO - c.pPiso
+                if esp_piso <= 1e-9:
+                    continue
+                extra = _organizar_posicoes_container(c.numero, [(item, fatia_residual)])
+                if not extra.linhas:
+                    continue
+                for l in extra.linhas:
+                    c.linhas.append(l)
+                c.peso += extra.peso
+                c.pPiso += extra.pPiso
+                c.pBase += extra.pBase
+                c.pTopo += extra.pTopo
+                progresso = True
+                break
+
+        if not progresso:
             break
 
-        sp = peso_max_este - c.peso
-        if sp < 0.5:
-            break
-        pc = sp / item.kgPal if item.kgPal > 0 else item.rPal
-        pa = min(pc, item.rPal)
+        # Recalcula fatias_por_container a partir do estado consolidado,
+        # para a próxima rodada de _calcular_sobras comparar correto.
+        novas_fatias = [[] for _ in range(n)]
+        for c_idx, c in enumerate(containers):
+            agregado = {}
+            for l in c.linhas:
+                key = l.sku
+                if key not in agregado:
+                    item_ref = next(it for it in items_copia if it.sku == l.sku)
+                    agregado[key] = [item_ref, dict(qtd=0.0, peso=0.0, pallets=0.0)]
+                agregado[key][1]["qtd"] += l.qtd
+                agregado[key][1]["peso"] += l.peso
+                agregado[key][1]["pallets"] += l.pallets
+            novas_fatias[c_idx] = [(v[0], v[1]) for v in agregado.values()]
+        fatias_por_container = novas_fatias
 
-        capac_total = esp_emp + esp_piso
-        if capac_total >= pa - 1e-6:
-            pa_emp = min(esp_emp, pa)
-            pa_piso = pa - pa_emp
-            pa_piso = min(pa_piso, esp_piso)
-        else:
-            pa_emp = esp_emp
-            pa_piso = esp_piso
-            pa = pa_emp + pa_piso
-
-        if pa < 1e-6:
-            break
-
-        if pa_emp > 1e-6:
-            pe_emp = pa_emp * item.kgPal
-            qa_emp = pa_emp * item.qtdPal
-            if c.peso + pe_emp > peso_max_este + 0.01:
-                pa_emp = (peso_max_este - c.peso) / item.kgPal
-                pe_emp = pa_emp * item.kgPal
-                qa_emp = pa_emp * item.qtdPal
-            if pe_emp >= 0.01:
-                _gravar(c, item, qa_emp, pa_emp, pe_emp, "TOPO")
-                c.pTopo += pa_emp
-            else:
-                pa_emp = 0.0
-
-        if pa_piso > 1e-6 and c.peso < peso_max_este - 0.5:
-            pe_piso = pa_piso * item.kgPal
-            qa_piso = pa_piso * item.qtdPal
-            if c.peso + pe_piso > peso_max_este + 0.01:
-                pa_piso = (peso_max_este - c.peso) / item.kgPal
-                pe_piso = pa_piso * item.kgPal
-                qa_piso = pa_piso * item.qtdPal
-            if pe_piso >= 0.01:
-                _gravar(c, item, qa_piso, pa_piso, pe_piso, "PISO")
-                c.pPiso += pa_piso
-            else:
-                pa_piso = 0.0
-
-        if pa_emp < 1e-6 and pa_piso < 1e-6:
-            break
+    peso_alocado = sum(c.peso for c in containers)
+    peso_original = sum(it.rPeso for it in items_copia)
+    sobra_total = max(0.0, peso_original - peso_alocado)
+    return containers, sobra_total
 
 
-def distribuir_containers(items_raw: list[dict]) -> list[Container]:
+def distribuir_containers(items_raw):
     """Recebe a lista de itens do PLANO (dicts) e retorna a lista de
-    containers já montados, seguindo a lógica v9.1 validada."""
+    containers já montados via fatiamento proporcional global."""
     items = [
         Item(
             sku=int(it["sku"]), produto=it["produto"], familia=it["familia"],
@@ -277,66 +395,26 @@ def distribuir_containers(items_raw: list[dict]) -> list[Container]:
         for it in items_raw
         if it["qtd"] and it["peso"] and it["pallets"]
     ]
+    if not items:
+        return []
 
-    # >>> pal_base_total considera apenas itens que SUSTENTAM empilhamento
-    # (ex: SARDINHA, ATUM). Itens não-frágeis sem sustentação (AZEITE)
-    # ocupam piso mas não entram nessa cota, pois não competem pelo
-    # espaço de empilhamento de TOPO.
-    pal_base_total = sum(it.rPal for it in items if it.eSustenta)
-    pal_piso_nao_sustenta = sum(it.rPal for it in items if not it.eFragil and not it.eSustenta)
     peso_total = sum(it.rPeso for it in items)
+    n_min_peso = max(1, math.ceil((peso_total - 50.0) / PESO_MAX))
 
-    # >>> Tolerância: o peso total pode passar de um múltiplo exato de
-    # PESO_MAX por uma fração mínima (ex: 8,0007 containers), o que
-    # forçaria ceil() a arredondar para 9 mesmo sendo essencialmente 8.
-    # Uma tolerância de até 50kg (~0.2% do limite) evita esse efeito.
-    TOLERANCIA_KG = 50.0
-    n_cont_peso = math.ceil((peso_total - TOLERANCIA_KG) / PESO_MAX) if peso_total > 0 else 1
-    n_cont_peso = max(n_cont_peso, 1)
-
-    # >>> Para o piso, considera TODAS as posições ocupadas (base que
-    # sustenta + base que não sustenta, ex: AZEITE), já que ambas
-    # disputam o mesmo limite de MAX_POSICOES_PISO por container.
-    pal_piso_total = pal_base_total + pal_piso_nao_sustenta
-    n_cont_piso = math.ceil(pal_piso_total / MAX_POSICOES_PISO) if pal_piso_total > 0 else 1
-    n_cont_estim = max(n_cont_peso, n_cont_piso, 1)
-
-    cota_base = pal_base_total / n_cont_estim if pal_base_total > 0.01 else 0.0
-
-    containers: list[Container] = []
-    c_num = 0
-
-    while any(it.rPeso > 0.01 for it in items):
-        c_num += 1
-        c = Container(numero=c_num)
-
-        limite_base = cota_base if c_num < n_cont_estim else float("inf")
-        # >>> No último container, libera uma margem extra de peso para
-        # absorver qualquer resíduo da tolerância usada na estimativa
-        # de n_cont_estim (evita sobrar peso sem container).
-        peso_max_este = PESO_MAX if c_num < n_cont_estim else PESO_MAX + TOLERANCIA_KG + 50
-
-        # Roda Fase1 -> Fase2 -> Fase1B (sem cota) em rodadas até estabilizar
-        for _ in range(20):
-            peso_antes = c.peso
-            _fase1_base(items, c, limite_base, peso_max_este)
-            _fase2_fragil(items, c, peso_max_este)
-
-            ainda_tem_fragil = any(it.eFragil and it.rPeso > 0.01 for it in items)
-            if (not ainda_tem_fragil and c.peso < peso_max_este - 0.5
-                    and c.pPiso < MAX_POSICOES_PISO - 1e-6):
-                _fase1_base(items, c, float("inf"), peso_max_este)
-
-            if abs(c.peso - peso_antes) < 1e-3:
-                break
-
-        # Segurança: se nada foi alocado neste container (não deveria
-        # acontecer), evita loop infinito.
-        if not c.linhas:
+    melhor_resultado = None
+    for n in range(n_min_peso, n_min_peso + 10):
+        containers, sobra_total = _tentar_distribuir_com_n(items, n)
+        if sobra_total < 1.0:
+            melhor_resultado = containers
             break
 
-        containers.append(c)
-        if c_num > 100:
-            break
+    if melhor_resultado is None:
+        melhor_resultado, _ = _tentar_distribuir_com_n(items, n_min_peso + 10)
 
-    return containers
+    # >>> Remove linhas com quantidade praticamente nula (resíduo de
+    # arredondamento de ponto flutuante das fatias proporcionais, ex:
+    # 0.0003 pallets) e containers que ficaram totalmente vazios.
+    for c in melhor_resultado:
+        c.linhas = [l for l in c.linhas if l.pallets > 0.005 and l.peso > 0.5]
+
+    return [c for c in melhor_resultado if c.linhas]
